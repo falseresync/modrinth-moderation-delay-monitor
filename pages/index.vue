@@ -1,7 +1,7 @@
 <template>
   <main class="page">
     <h1>Modrinth moderation delay monitor</h1>
-
+    
     <h2>Overall delays</h2>
     <ul>
       <li>Median: {{ toDays(overallMedianDelay) }} days</li>
@@ -9,14 +9,19 @@
     </ul>
 
     <h2>Delays by project type</h2>
-    <template v-for="projectType in projectTypes">
-      <h3>Delays for `{{ projectType }}`</h3>
-      <ul>
-        <li>Median: {{ toDays(delaysByType.get(projectType)?.median) }} days</li>
-        <li>99th percentile: {{ toDays(delaysByType.get(projectType)?.$99Percentile) }} days</li>
-      </ul>
-    </template>
-    
+    <section class="by-type">
+      <template v-for="projectType in PROJECT_TYPES">
+        <article>
+            <h3>`{{ projectType }}`</h3>
+            <ul>
+              <li>Median: {{ toDays(delaysByType.get(projectType)?.median) }} days</li>
+              <li>99th percentile: {{ toDays(delaysByType.get(projectType)?.$99Percentile) }} days</li>
+            </ul>
+        </article>
+      </template>
+    </section>
+   
+
     <h2>Explanation</h2>
     <h3>What the numbers mean</h3>
     <p>
@@ -34,24 +39,21 @@
 
     <h3>How it's calculated</h3>
     <p>
-      To calculate these statistics I have used the `date_created` and `date_modified` fields.
-      In order to keep the statistics relevant I only query projects, that have been submitted to the moderation last week.
+      In order to keep the statistics relevant I only query projects, 
+      that have been submitted to the moderation last week.
     </p>
     <p>
-      The `date_created` field is populated differently, than one might expect, namely it's
-      when the project is reviewed by the moderators and published to the search index, 
-      NOT when it's first created.
+      The `date_modified` field can be used as a decent metric to guess
+      when the project was submitted to the moderation,
+      since people would tend to submit the project
+      immediately after making the changes they want or need.
     </p>
     <p>
-      The `date_modified` field on the other hand can be used as a decent metric to guess when the project was submitted to the moderation,
-      since people would tend to submit the project immediately after making the changes they want or need.
-      However, it is not a perfect metric and I have to check, that it's actually happened before the publication date, 
-      i.e. that the project wasn't already updated *after* it passed moderation.
+      Then I query all of the found projects and retrieve `approved` and `queued` fields.
     </p>
-    <ul>
-      <li>{{ allProjectsData.length }} projects created or modified in the last week queried</li>
-      <li>{{ allProjects.length }} projects not modified after publication considered</li>
-    </ul>
+    <p>
+      <strong>{{ allProjects.length }} projects considered</strong>
+    </p>
   </main>
   <footer class="footer">
     falseresync &copy; 2025
@@ -63,79 +65,80 @@ import { median, quantile } from 'simple-statistics'
 
 const MILLIS_IN_DAY = 1000 /* s */ * 60 /* m */ * 60 /* h */ * 24 /* d */;
 const MILLIS_IN_WEEK = MILLIS_IN_DAY * 7;
+const WEEK_AGO = (Date.now() - MILLIS_IN_WEEK) / 1000 /* has to be in seconds */;
 
-function toDays(duration?: number): string {
-  if (duration == undefined) {
-    return NaN.toFixed(0)
-  }
-  return (duration / MILLIS_IN_DAY).toFixed(2);
-}
+const PROJECT_TYPES = ['mod', 'modpack', 'datapack', 'resourcepack', 'shader', 'plugin']
 
-interface Delays {
-  $99Percentile: number
-  median: number
+class Delays {
+  $99Percentile!: number;
+  median!: number;
 }
 
 interface Project {
-  projectType: string
-  datePublished: Date
-  dateSubmitted: Date
+  dateApproved: Date
+  dateQueued: Date
   reviewDelay: number
 }
 
-interface ProjectData {
-  project_type: string
-  loaders: string[]
-  date_created: string
-  date_modified: string
+interface ProjectGetDto {
+  approved: string
+  queued: string
 }
 
-interface SearchResponse {
-  hits: ProjectData[]
+interface ProjectSearchDto {
+  project_id: string
 }
 
-const weekAgo = (Date.now() - MILLIS_IN_WEEK) / 1000 /* has to be in seconds */;
-const projectTypes: string[] = await $fetch('https://api.modrinth.com/v2/tag/project_type', {});
-const responses: SearchResponse[] = await Promise.all(
-  projectTypes.flatMap(
-    projectType => [
-      $fetch<SearchResponse>(`https://api.modrinth.com/v2/search?index=newest&limit=100&facets=[["project_type:${projectType}"],["modified_timestamp > ${weekAgo}"]]`)
-    ]
+function toDays(duration?: number): string {
+  if (duration == undefined) {
+    return NaN.toString()
+  }
+  return (duration / MILLIS_IN_DAY).toFixed(1);
+}
+
+function makeSearchUrl(projectType: string, breakpointDate: number = WEEK_AGO): string {
+  return `https://api.modrinth.com/v2/search?index=newest&limit=100&facets=[["project_type:${projectType}"],["modified_timestamp > ${breakpointDate}"]]`;
+}
+
+function makeGetUrl(ids: string[]): string {
+  return `https://api.modrinth.com/v2/projects?ids=["${ids.join('","')}"]`;
+}
+
+const projectIds: Map<string, string[]> = new Map(await Promise.all(
+  PROJECT_TYPES.map(
+    projectType => $fetch<{ hits: ProjectSearchDto[] }>(makeSearchUrl(projectType))
+      .then(response => [projectType, response.hits.map(projectsDto => projectsDto.project_id)] as [string, string[]])
   )
-)
+))
 
-const allProjectsData: ProjectData[] = responses.flatMap(response => response.hits)
+const projects: Map<string, Project[]> = new Map(await Promise.all(
+  projectIds.entries().toArray()
+    .map(([projectType, ids]) => $fetch<ProjectGetDto[]>(makeGetUrl(ids))
+      .then(projectGetDtos => {
+        return [
+          projectType,
+          projectGetDtos
+            .map(projectGetDto => {
+              const datePublished = new Date(projectGetDto.approved)
+              const dateSubmitted = new Date(projectGetDto.queued)
+              return {
+                dateApproved: datePublished,
+                dateQueued: dateSubmitted,
+                reviewDelay: datePublished.getTime() - dateSubmitted.getTime()
+              } as Project
+            })
+        ] as [string, Project[]]
+      }) as Promise<[string, Project[]]>
+  )
+))
 
-const allProjects: Project[] = allProjectsData
-  .map(projectData => {
-    const datePublished = new Date(projectData.date_created)
-    const dateSubmitted =  new Date(projectData.date_modified)
-    let projectType = projectData.project_type; 
-    switch (projectData.project_type) {
-      case 'mod':
-        if (projectData.loaders.includes('datapack')) {
-          projectType = 'datapack';
-        }
-        break;
-              
-    }
-    return {
-      projectType: projectData.project_type,
-      datePublished,
-      dateSubmitted,
-      reviewDelay: datePublished.getTime() - dateSubmitted.getTime()
-    } as Project
-  })
-  // If the project was updated after it has been reviewed we cannot determine the delay
-  .filter(project => project.reviewDelay > 0) 
+const allProjects: Project[] = projects.values().toArray().flatMap(projectsOfType => projectsOfType)
+const allReviewDelays: number[] = allProjects.map(project => project.reviewDelay)
+const overall99PercentileDelay: number = quantile(allReviewDelays, 0.99)
+const overallMedianDelay: number = median(allReviewDelays)
 
-const allReviewDelays = allProjects.map(project => project.reviewDelay)
-const overall99PercentileDelay = quantile(allReviewDelays, 0.99)
-const overallMedianDelay = median(allReviewDelays)
-
-const projectsByType: Map<string, Project[]> = Map.groupBy(allProjects, ({ projectType }) => projectType)
 const delaysByType: Map<String, Delays> = new Map(
-  projectsByType.entries().map(([projectType, projects]) => {
+  projects.entries().map(([projectType, projects]) => {
     const delays = projects.map(project => project.reviewDelay)
     return [projectType, { $99Percentile: quantile(delays, 0.99), median: median(delays) } as Delays]
   })
@@ -151,6 +154,12 @@ body {
 .page {
   max-width: 50rem;
   margin: 0 auto 5rem auto;
+}
+
+.by-type {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(3, 1fr);
 }
 
 .footer {
